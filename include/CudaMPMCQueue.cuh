@@ -607,6 +607,7 @@ __device__ optional<uint64_t> MPMCQueue<T>::try_clear_range(const uint64_t start
 
     uint32_t entry = tid;
     uint32_t ballot = 0;
+    bool overshoot = false;
     // Loop until non-zero bitmap entry is found
     while (!(ballot = __ballot_sync(active_mask, bitmap_val)))
     {
@@ -616,6 +617,7 @@ __device__ optional<uint64_t> MPMCQueue<T>::try_clear_range(const uint64_t start
             // Reached end
             // Set to non-zero to pass ballot if all bits are cleared
             bitmap_val = 0xFFFFFFFF;
+            overshoot = true;
         }
         else
         {
@@ -639,6 +641,9 @@ __device__ optional<uint64_t> MPMCQueue<T>::try_clear_range(const uint64_t start
 
     assert(__popc(__activemask()) == 1);
 
+    if(overshoot)
+        return {end};
+
     if (idx == end_idx)
     {
         // Mask end index
@@ -661,8 +666,6 @@ template<typename T>
 __device__
 bool MPMCQueue<T>::try_clear_head()
 {
-    if(_capacity == 1) // Only one valid head. Can't clear
-        return false;
     // Early exit if no pending requests
     if(_head_safe == _head_unsafe.value())
         return false;
@@ -702,8 +705,6 @@ template<typename T>
 __device__
 bool MPMCQueue<T>::try_clear_tail()
 {
-    if(_capacity == 1) // Only one valid tail. Can't clear
-        return false;
     // Early exit if no pending pops
     if(_tail_safe == _tail_unsafe.value())
         return false;
@@ -739,10 +740,6 @@ bool MPMCQueue<T>::try_clear_tail()
 }
 
 #else
-
-/*
- * TODO These are probably super out of date
- */
 
 template<typename T>
 template<bool flip>
