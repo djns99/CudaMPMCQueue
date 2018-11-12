@@ -1,0 +1,3 @@
+setup_test(UnitTestsCpu)
+setup_test(ThreadedTestsCpu)
+setup_test(StressTestsCpu)
