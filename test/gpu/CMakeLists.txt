@@ -1,1 +1,1 @@
-setup_test(MPMC-Queue-Test)
+setup_test(UnitTestsGpu)
