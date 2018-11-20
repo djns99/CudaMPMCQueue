@@ -37,7 +37,8 @@ __managed__ cuAtomic<uint64_t>* GPU_GTEST_FAILURE = nullptr;
         int occupancy; cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occupancy, kernel, threads, 0); \
         int dev; cudaGetDevice(&dev); \
         cudaDeviceProp deviceProp; cudaGetDeviceProperties(&deviceProp, dev); \
-        ASSERT_LE(ceil_div<uint64_t>(blocks, occupancy), deviceProp.multiProcessorCount) << "Too many threads"; \
+        ASSERT_NE(occupancy, 0) << "Cannot run kernel with " << threads << " threads"; \
+        ASSERT_LE(ceil_div<uint64_t>(blocks, occupancy), deviceProp.multiProcessorCount) << "Too many threads: " << blocks << "/" << occupancy; \
         ASSERT_EQ(cudaLaunchCooperativeKernel((void*)kernel, blocks, threads, args), cudaSuccess) << "Launch failed"; \
     } else { \
         kernel<<<blocks, threads>>>(queue, capacity, num_threads); \

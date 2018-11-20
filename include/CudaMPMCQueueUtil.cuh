@@ -66,9 +66,13 @@ public:
 class cuMutex {
 private:
     uint32_t _lock;
+    const bool _is_local;
 public:
     __host__ __device__
-    cuMutex() : _lock(false) {
+    cuMutex() :
+        _lock(false),
+        _is_local(isLocal(this)){
+
     }
 
     /*
@@ -76,6 +80,8 @@ public:
      */
     __host__ __device__
     bool try_lock() {
+        if(_is_local)
+            return true; // Local __device__ variable always succeeds
         // TODO Potential optimization for warps - Only one thread attempts to obtain lock
         return !_lock && !heterogeneousExch(&_lock, true); // Fail without atomic op if possible
     }
@@ -93,11 +99,15 @@ public:
 
 template<class T>
 class cuAtomic {
-private:
-    T ctr;
+public:
+    T _ctr;
+    const bool _is_local;
 public:
     __host__ __device__
-    cuAtomic(T val) : ctr(val) {
+    cuAtomic(T val) :
+        _ctr(val),
+        _is_local(isLocal(this))
+    {
     }
 
 //    __host__ __device__
@@ -122,7 +132,14 @@ public:
 
     __host__ __device__
     T atomic_add(T val) {
-        T out = heterogeneousAdd(&ctr, val);
+        T out;
+        if(!_is_local) {
+            out = heterogeneousAdd(&_ctr, val);
+        } else {
+            // Local var. No atomics
+            out = _ctr;
+            _ctr += val;
+        }
         // Crude catch for wrapping
         assert(out < INT64_MAX - val || out > INT64_MAX);
         return out;
@@ -130,14 +147,108 @@ public:
 
     __host__ __device__
     T atomic_sub(T val) {
-        T out = heterogeneousAdd(&ctr, -val);
+        T out;
+        if(!_is_local) {
+            out = heterogeneousAdd(&_ctr, -val);
+        } else {
+            // Local var. No atomics
+            out = _ctr;
+            _ctr += val;
+        }
         // Crude catch for wrapping.
         assert(out > INT64_MAX + val || out < INT64_MAX);
         return out;
     }
 
     __host__ __device__
-    T value() const { return ctr; }
+    T value() const { return _ctr; }
+};
+
+
+typedef uint32_t bitmap_entry;
+typedef uint32_t bitmap_mask;
+
+class cuBitmap {
+private:
+   const size_t _bitmap_len;
+   bitmap_entry* const _bitmap_buffer;
+   const bool _using_heterogeneous_mem;
+   const bool _is_local;
+public:
+
+   __host__ __device__
+    cuBitmap(size_t len, bool use_heterogeneous_mem) :
+       _bitmap_len(len),
+       _bitmap_buffer(heterogeneousAlloc<bitmap_entry>(_bitmap_len, use_heterogeneous_mem)),
+       _using_heterogeneous_mem(use_heterogeneous_mem),
+       _is_local(isLocal(this))
+    {
+        if(_bitmap_buffer == nullptr) {
+            printf("Failed to allocate %lu bitmap entries\n", _bitmap_len);
+            assert(false);
+            return;
+        }
+        heterogeneousMemset(_bitmap_buffer, 0x0, _bitmap_len * sizeof(bitmap_entry), _using_heterogeneous_mem);
+    }
+
+   __host__ __device__
+    ~cuBitmap() {
+        heterogeneousFree(_bitmap_buffer, _using_heterogeneous_mem);
+    }
+
+    /*
+     * Sets specified bit
+     */
+   __host__ __device__
+    void setBit(size_t bit_idx) {
+       if(_is_local)
+           _bitmap_buffer[bit_idx >> 5] |= 1 << (bit_idx & 31);
+       else
+           heterogeneousOr(_bitmap_buffer + (bit_idx >> 5), 1 << (bit_idx & 31));
+    }
+
+    /*
+     * Clears specified bit
+     */
+   __host__ __device__
+    void clearBit(size_t bit_idx) {
+       if(_is_local)
+           _bitmap_buffer[bit_idx >> 5] &= ~(1 << (bit_idx & 31));
+       else
+           heterogeneousAnd(_bitmap_buffer + (bit_idx >> 5), ~(1 << (bit_idx & 31)));
+    }
+
+    /*
+     * Sets all bits set in mask
+     *
+     * entry_idx The bitmap entry to operate on (bit_idx / 32)
+     */
+   __host__ __device__
+    void setMask(size_t entry_idx, bitmap_mask mask) {
+       if(_is_local)
+           _bitmap_buffer[entry_idx] |= mask;
+       else
+           heterogeneousOr(_bitmap_buffer + entry_idx, mask);
+    }
+
+    /*
+     * Clear all bits cleared in mask
+     *
+     * entry_idx The bitmap entry to operate on (bit_idx / 32)
+     */
+   __host__ __device__
+    void clearMask(size_t entry_idx, bitmap_mask mask) {
+       if(_is_local)
+           _bitmap_buffer[entry_idx] &= mask;
+       else
+           heterogeneousAnd(_bitmap_buffer + entry_idx, mask);
+    }
+
+   __host__ __device__
+    bitmap_entry operator[](size_t idx) const {
+        assert(idx < _bitmap_len);
+        return _bitmap_buffer[idx];
+    }
 };
 
 } // CudaMPMCQueue

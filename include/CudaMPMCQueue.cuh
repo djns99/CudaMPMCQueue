@@ -10,8 +10,6 @@
 
 namespace CudaMPMCQueue {
 
-typedef uint32_t bitmap_entry;
-typedef uint32_t bitmap_mask;
 // Enable if the queue will be in prolonged usage
 // Avoids uint64_t overflows by reducing the counters when clearing head/tail
 // #define AVOID_OVERFLOWS 1
@@ -114,7 +112,13 @@ private:
 
     __host__ __device__ bool try_push_internal(T val);
     __host__ __device__ optional<T> try_pop_internal();
-#ifdef __CUDA_ARCH__
+
+    template<bool flip>
+    __host__ __device__ optional<uint64_t> try_clear_range(uint64_t start, uint64_t end) const;
+
+    __host__ __device__ bool try_clear_head();
+    __host__ __device__ bool try_clear_tail();
+
     __device__ uint32_t get_active_mask() const;
 
     __device__ bool try_push_internal_warp(T val, uint32_t active_mask);
@@ -122,17 +126,10 @@ private:
     __device__ optional<T> try_pop_internal_warp(uint32_t active_mask);
 
     template<bool flip>
-    __device__ optional<uint64_t> try_clear_range(uint64_t start, uint64_t end, uint32_t active_mask) const;
+    __device__ optional<uint64_t> try_clear_range_warp(uint64_t start, uint64_t end, uint32_t active_mask) const;
 
-    __device__ bool try_clear_head();
-    __device__ bool try_clear_tail();
-#else
-    template<bool flip>
-    __host__ optional<uint64_t> try_clear_range(uint64_t start, uint64_t end) const;
-
-    __host__ bool try_clear_head();
-    __host__ bool try_clear_tail();
-#endif
+    __device__ bool try_clear_head_warp();
+    __device__ bool try_clear_tail_warp();
 
     const uint64_t _capacity;
     const uint64_t _capacity_log;
@@ -148,10 +145,12 @@ private:
     cuAtomic<uint64_t> _size;
     cuAtomic<uint64_t> _free;
     const uint64_t _bitmap_len;
-    bitmap_entry* const _write_bitmap;
+    cuBitmap _write_bitmap;
 
     cuMutex _updating_head{};
     cuMutex _updating_tail{};
+
+    const bool _is_local;
 
     // Tuning parameter
     // The number of active threads in a warp before using warp based methods
@@ -174,23 +173,22 @@ __host__ __device__ MPMCQueue<T>::MPMCQueue(uint64_t capacity, bool use_heteroge
                 _size(0),
                 _free(_capacity),
                 _bitmap_len(ceil_div<uint64_t>(_capacity, 32ull)),
-                _write_bitmap(heterogeneousAlloc<bitmap_entry>(_bitmap_len, use_heterogeneous_mem))
+                _write_bitmap(_bitmap_len, use_heterogeneous_mem),
+                _is_local(isLocal(this))
 {
-    if (_data == nullptr || _write_bitmap == nullptr)
+    if (_data == nullptr)
     {
         // Not much we can do here. CUDA doesn't support exceptions
         printf("Failed to allocate %lu entries\n", _capacity);
         assert(false);
         return;
     }
-    heterogeneousMemset(_write_bitmap, 0x0, _bitmap_len * sizeof(bitmap_entry), _using_heterogeneous_mem);
 }
 
 template<typename T>
 __host__ __device__ MPMCQueue<T>::~MPMCQueue()
 {
     heterogeneousFree(_data, _using_heterogeneous_mem);
-    heterogeneousFree(_write_bitmap, _using_heterogeneous_mem);
 }
 
 template<typename T>
@@ -198,11 +196,13 @@ __host__ __device__
 bool MPMCQueue<T>::try_push(T val)
 {
 #ifdef __CUDA_ARCH__
-    uint32_t mask = get_active_mask();
-    uint32_t active_count = __popc(mask);
-    if (active_count >= _use_warp)
-    {
-        return try_push_internal_warp(val, mask);
+    if(!_is_local) {
+        uint32_t mask = get_active_mask();
+        uint32_t active_count = __popc(mask);
+        if (active_count >= _use_warp)
+        {
+            return try_push_internal_warp(val, mask);
+        }
     }
 #endif
     return try_push_internal(val);
@@ -221,11 +221,13 @@ __host__ __device__
 optional<T> MPMCQueue<T>::try_pop()
 {
 #ifdef __CUDA_ARCH__
-    uint32_t mask = get_active_mask();
-    uint32_t active_count = __popc(mask);
-    if (active_count >= _use_warp)
-    {
-        return try_pop_internal_warp(mask);
+    if(!_is_local) {
+        uint32_t mask = get_active_mask();
+        uint32_t active_count = __popc(mask);
+        if (active_count >= _use_warp)
+        {
+            return try_pop_internal_warp(mask);
+        }
     }
 #endif
     return try_pop_internal();
@@ -338,7 +340,7 @@ __host__ __device__ bool MPMCQueue<T>::try_push_internal(T val)
     // Get index of next available slot
     uint64_t idx = mod_capacity(_head_unsafe.atomic_add(1ul));
     _data[idx] = val; // Write data
-    heterogeneousOr(_write_bitmap + (idx >> 5), 0x1 << (idx & 31)); // Set bit
+    _write_bitmap.setBit(idx); // Set bit
     try_clear_head(); // Try to advance head pointer
     return true;
 }
@@ -359,12 +361,149 @@ optional<T> MPMCQueue<T>::try_pop_internal()
     // Get index of next available element
     uint64_t idx = mod_capacity(_tail_unsafe.atomic_add(1ul));
     T out = _data[idx]; // Read data
-    heterogeneousAnd(_write_bitmap + (idx >> 5), ~(0x1 << (idx & 31))); // Unset bit
+    _write_bitmap.clearBit(idx); // Unset bit
     try_clear_tail(); // Try to advance tail pointer
     return {out};
 }
 
+template<typename T>
+template<bool flip>
+__host__ __device__
+optional<uint64_t> MPMCQueue<T>::try_clear_range(const uint64_t start, const uint64_t end) const
+{
+    if(start == end)
+        return {};
+
+    // Assumes exclusive access to bitmap by warp
+
+    const uint64_t start_mod = mod_capacity(start);
+    const uint64_t end_mod = mod_capacity(end);
+
+    const uint64_t end_prev = end_mod == 0 ? _capacity - 1 : end_mod - 1;
+    const uint64_t end_idx = end_prev >> 5;
+    uint64_t idx = start_mod >> 5;
+
+    // Mask for ranges starting partway through entry
+    const uint32_t start_off = start_mod & 31;
+    const bitmap_mask start_mask = (~0) << start_off;
+
+    // Load initial bitmap value
+    bitmap_entry bitmap_val = _write_bitmap[idx];
+    if(flip) // Expect 1s - flip bits so 1 -> 0
+        bitmap_val = ~bitmap_val;
+
+    // Mask after flip so correct bits are dropped
+    bitmap_val &= start_mask;
+
+    // Mask final (partial) bitmap entry for non-multiple 32 capacity
+    const uint64_t final_bit_off = (_capacity - 1) & 31;
+    const bitmap_mask last_entry_mask = (~0u) >> (31u - final_bit_off);
+    if(idx == _bitmap_len - 1)
+        bitmap_val &= last_entry_mask;
+
+    // Loop until incorrect bit or end of range
+    while(!bitmap_val && idx != end_idx) {
+        // Inc and wrap
+        idx = (idx == _bitmap_len - 1) ? 0 : idx + 1;
+        // Load new bitmap value
+        bitmap_val = _write_bitmap[idx];
+        if(flip)
+            bitmap_val = ~bitmap_val;
+        if(idx == _bitmap_len - 1)
+            bitmap_val &= last_entry_mask;
+    }
+
+    if(idx == end_idx) {
+        const uint32_t end_off = end_mod & 31;
+        const bitmap_mask end_mask = (~0u) >> (31u - end_off);
+        bitmap_val &= end_mask;
+        if(bitmap_val == 0) // No bits were set. Clear full range
+            return {end};
+    }
+
+    // Location of first incorrectly set bit
+    uint64_t new_start = idx * 32 + (ffs(bitmap_val) - 1);
+    if(new_start < start_mod)
+        new_start += _capacity;
+
+    // Add number of spots advanced
+    return {start + (new_start - start_mod)};
+}
+
+template<typename T>
+__host__ __device__
+bool MPMCQueue<T>::try_clear_head()
+{
+    // Early exit if no pending requests
+    if(_head_safe == _head_unsafe.value())
+        return false;
+
 #ifdef __CUDA_ARCH__
+    if(!_is_local) {
+        return try_clear_head_warp();
+    }
+#endif
+
+    if (!_updating_head.try_lock())
+        return false;
+    uint64_t old = _head_safe;
+    optional<uint64_t> new_head_opt = try_clear_range<true>(_head_safe, _head_unsafe.value());
+    if(new_head_opt) {
+        uint64_t new_head_value = new_head_opt.value();
+        _head_safe = new_head_value;
+        _size.atomic_add(new_head_value - old);
+
+#ifdef AVOID_OVERFLOWS
+        // Reduce counters to avoid overflows
+        if(new_head_value > _capacity) {
+            uint64_t div = div_capacity(new_head_value);
+            // Values should only decrease here.
+            _head_unsafe.atomic_sub(_capacity * div);
+            _head_safe -= _capacity * div;
+        }
+#endif
+    }
+    _updating_head.unlock();
+    return new_head_opt.has_value();
+}
+
+template<typename T>
+__host__ __device__
+bool MPMCQueue<T>::try_clear_tail()
+{
+    // Early exit if no pending requests
+    if(_tail_safe == _tail_unsafe.value())
+        return false;
+
+#ifdef __CUDA_ARCH__
+    if(!_is_local) {
+        return try_clear_tail_warp();
+    }
+#endif
+
+    if (!_updating_tail.try_lock())
+        return false;
+    uint64_t old = _tail_safe;
+    optional<uint64_t> new_tail_opt = try_clear_range<false>(_tail_safe, _tail_unsafe.value());
+    if(new_tail_opt) {
+        uint32_t new_tail_value = new_tail_opt.value();
+        _tail_safe = new_tail_value;
+        _free.atomic_add(new_tail_value - old);
+
+#ifdef AVOID_OVERFLOWS
+        // Reduce counters to avoid overflows
+        if(new_tail_value > _capacity) {
+            uint64_t div = div_capacity(new_tail_value);
+            // Values should only decrease here.
+            _tail_unsafe.atomic_sub(_capacity * div);
+            _tail_safe -= _capacity * div;
+        }
+#endif
+    }
+    _updating_tail.unlock();
+    return new_tail_opt.has_value();
+}
+
 template<class T>
 __device__ uint32_t match_any_sync(uint32_t mask, const MPMCQueue<T>* const p) {
 #if __CUDA_ARCH__ >= 700
@@ -380,19 +519,11 @@ __device__ uint32_t match_any_sync(uint32_t mask, const MPMCQueue<T>* const p) {
 template<typename T>
 __device__
 uint32_t MPMCQueue<T>::get_active_mask() const {
-    uint32_t active_mask = __activemask();
-    uint32_t islocal = 0;
-
-    asm volatile ("{ \n\t"
-                  "    .reg .pred p; \n\t"
-                  "    isspacep.local p, %1; \n\t"
-                  "    selp.u32 %0, 1, 0, p;  \n\t"
-                  "} \n\t" : "=r"(islocal) : "l"(this));
-    active_mask = __ballot_sync(active_mask, !islocal);
-    if(islocal) {
+    if(_is_local) {
         return 1 << (threadIdx.x & 31);
     }
 
+    uint32_t active_mask = __activemask();
     return match_any_sync(active_mask, this);
 }
 
@@ -400,6 +531,8 @@ template<typename T>
 __device__
 bool MPMCQueue<T>::try_push_internal_warp(T val, uint32_t active_mask)
 {
+    assert(!_is_local);
+
     // Get thread/warp info
     uint32_t active_threads = __popc(active_mask);
     uint32_t lane = threadIdx.x & 31;
@@ -484,7 +617,7 @@ bool MPMCQueue<T>::try_push_internal_warp(T val, uint32_t active_mask)
             num = successful - wrap_tid; // Will always be < 32
 
         bitmap_mask mask = (1 << num) - 1;
-        heterogeneousOr(_write_bitmap + my_b_idx, mask << b_off); // Set bit
+        _write_bitmap.setMask(my_b_idx, mask << b_off);
 
         entry += active_threads; // Loops for < 3 threads
     }
@@ -497,6 +630,8 @@ template<typename T>
 __device__
 optional<T> MPMCQueue<T>::try_pop_internal_warp(uint32_t active_mask)
 {
+    assert(!_is_local);
+
     // Get thread/warp info
     uint32_t active_threads = __popc(active_mask);
     uint32_t lane = threadIdx.x & 31;
@@ -582,7 +717,7 @@ optional<T> MPMCQueue<T>::try_pop_internal_warp(uint32_t active_mask)
             num = successful - wrap_tid; // Will always be < 32
 
         bitmap_mask mask = (1 << num) - 1;
-        heterogeneousAnd(_write_bitmap + my_b_idx, ~(mask << b_off)); // Set bit
+        _write_bitmap.clearMask(my_b_idx, ~(mask << b_off)); // Set bit
 
         entry += active_threads; // Loops for < 3 threads
     }
@@ -593,9 +728,11 @@ optional<T> MPMCQueue<T>::try_pop_internal_warp(uint32_t active_mask)
 
 template<typename T>
 template<bool flip>
-__device__ optional<uint64_t> MPMCQueue<T>::try_clear_range(const uint64_t start, const uint64_t end,
+__device__ optional<uint64_t> MPMCQueue<T>::try_clear_range_warp(const uint64_t start, const uint64_t end,
         uint32_t active_mask) const
 {
+    assert(!_is_local);
+
     // Assumes exclusive access to bitmap by warp
     if(start == end)
         return {};
@@ -698,18 +835,16 @@ __device__ optional<uint64_t> MPMCQueue<T>::try_clear_range(const uint64_t start
 
 template<typename T>
 __device__
-bool MPMCQueue<T>::try_clear_head()
+bool MPMCQueue<T>::try_clear_head_warp()
 {
-    // Early exit if no pending requests
-    if(_head_safe == _head_unsafe.value())
-        return false;
+    assert(!_is_local);
 
     uint32_t active_mask = get_active_mask();
     if (!__any_sync(active_mask, _updating_head.try_lock())) // Did this warp obtain the bitmap
         return false;
     // Warp has exclusive access to bitmap between head_safe and head_unsafe
     uint64_t old = _head_safe;
-    optional<uint64_t> new_head_opt = try_clear_range<true>(_head_safe, _head_unsafe.value(), active_mask);
+    optional<uint64_t> new_head_opt = try_clear_range_warp<true>(_head_safe, _head_unsafe.value(), active_mask);
     if (new_head_opt)
     {
         uint64_t new_head_value = new_head_opt.value();
@@ -737,18 +872,16 @@ bool MPMCQueue<T>::try_clear_head()
 
 template<typename T>
 __device__
-bool MPMCQueue<T>::try_clear_tail()
+bool MPMCQueue<T>::try_clear_tail_warp()
 {
-    // Early exit if no pending pops
-    if(_tail_safe == _tail_unsafe.value())
-        return false;
+    assert(!_is_local);
 
     uint32_t active_mask = get_active_mask();
     if (!__any_sync(active_mask, _updating_tail.try_lock())) // Did this warp obtain the bitmap
         return false;
     // Warp has exclusive access to bitmap between tail_safe and tail_unsafe
     uint64_t old = _tail_safe;
-    optional<uint64_t> new_tail_opt = try_clear_range<false>(_tail_safe, _tail_unsafe.value(), active_mask);
+    optional<uint64_t> new_tail_opt = try_clear_range_warp<false>(_tail_safe, _tail_unsafe.value(), active_mask);
     if (new_tail_opt)
     {
         uint32_t new_tail_value = new_tail_opt.value();
@@ -772,135 +905,6 @@ bool MPMCQueue<T>::try_clear_tail()
     // All threads return if we successfully advanced tail
     return __any_sync(active_mask, new_tail_opt.has_value());
 }
-
-#else
-
-template<typename T>
-template<bool flip>
-__host__
-optional<uint64_t> MPMCQueue<T>::try_clear_range(const uint64_t start, const uint64_t end) const
-{
-    if(start == end)
-        return {};
-
-    // Assumes exclusive access to bitmap by warp
-
-    const uint64_t start_mod = mod_capacity(start);
-    const uint64_t end_mod = mod_capacity(end);
-
-    const uint64_t end_prev = end_mod == 0 ? _capacity - 1 : end_mod - 1;
-    const uint64_t end_idx = end_prev >> 5;
-    uint64_t idx = start_mod >> 5;
-
-    // Mask for ranges starting partway through entry
-    const uint32_t start_off = start_mod & 31;
-    const bitmap_mask start_mask = (~0) << start_off;
-
-    // Load initial bitmap value
-    bitmap_entry bitmap_val = _write_bitmap[idx];
-    if(flip) // Expect 1s - flip bits so 1 -> 0
-        bitmap_val = ~bitmap_val;
-
-    // Mask after flip so correct bits are dropped
-    bitmap_val &= start_mask;
-
-    // Mask final (partial) bitmap entry for non-multiple 32 capacity
-    const uint64_t final_bit_off = (_capacity - 1) & 31;
-    const bitmap_mask last_entry_mask = (~0u) >> (31u - final_bit_off);
-    if(idx == _bitmap_len - 1)
-        bitmap_val &= last_entry_mask;
-
-    // Loop until incorrect bit or end of range
-    while(!bitmap_val && idx != end_idx) {
-        // Inc and wrap
-        idx = (idx == _bitmap_len - 1) ? 0 : idx + 1;
-        // Load new bitmap value
-        bitmap_val = _write_bitmap[idx];
-        if(flip)
-            bitmap_val = ~bitmap_val;
-        if(idx == _bitmap_len - 1)
-            bitmap_val &= last_entry_mask;
-    }
-
-    if(idx == end_idx) {
-        const uint32_t end_off = end_mod & 31;
-        const bitmap_mask end_mask = (~0u) >> (31u - end_off);
-        bitmap_val &= end_mask;
-        if(bitmap_val == 0) // No bits were set. Clear full range
-            return {end};
-    }
-
-    // Location of first incorrectly set bit
-    uint64_t new_start = idx * 32 + (ffs(bitmap_val) - 1);
-    if(new_start < start_mod)
-        new_start += _capacity;
-
-    // Add number of spots advanced
-    return {start + (new_start - start_mod)};
-}
-
-template<typename T>
-__host__
-bool MPMCQueue<T>::try_clear_head()
-{
-    // Early exit if no pending requests
-    if(_head_safe == _head_unsafe.value())
-        return false;
-
-    if (!_updating_head.try_lock())
-        return false;
-    uint64_t old = _head_safe;
-    optional<uint64_t> new_head_opt = try_clear_range<true>(_head_safe, _head_unsafe.value());
-    if(new_head_opt) {
-        uint64_t new_head_value = new_head_opt.value();
-        _head_safe = new_head_value;
-        _size.atomic_add(new_head_value - old);
-
-#ifdef AVOID_OVERFLOWS
-        // Reduce counters to avoid overflows
-        if(new_head_value > _capacity) {
-            uint64_t div = div_capacity(new_head_value);
-            // Values should only decrease here.
-            _head_unsafe.atomic_sub(_capacity * div);
-            _head_safe -= _capacity * div;
-        }
-#endif
-    }
-    _updating_head.unlock();
-    return new_head_opt.has_value();
-}
-
-template<typename T>
-__host__
-bool MPMCQueue<T>::try_clear_tail()
-{
-    // Early exit if no pending requests
-    if(_tail_safe == _tail_unsafe.value())
-        return false;
-
-    if (!_updating_tail.try_lock())
-        return false;
-    uint64_t old = _tail_safe;
-    optional<uint64_t> new_tail_opt = try_clear_range<false>(_tail_safe, _tail_unsafe.value());
-    if(new_tail_opt) {
-        uint32_t new_tail_value = new_tail_opt.value();
-        _tail_safe = new_tail_value;
-        _free.atomic_add(new_tail_value - old);
-
-#ifdef AVOID_OVERFLOWS
-        // Reduce counters to avoid overflows
-        if(new_tail_value > _capacity) {
-            uint64_t div = div_capacity(new_tail_value);
-            // Values should only decrease here.
-            _tail_unsafe.atomic_sub(_capacity * div);
-            _tail_safe -= _capacity * div;
-        }
-#endif
-    }
-    _updating_tail.unlock();
-    return new_tail_opt.has_value();
-}
-#endif
 
 } // CudaMPMCQueue
 

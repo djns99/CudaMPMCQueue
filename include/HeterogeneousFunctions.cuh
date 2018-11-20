@@ -7,7 +7,24 @@
 
 namespace CudaMPMCQueue {
 
+#ifndef NO_SYSTEM_ATOMICS
 #define USE_SYSTEM_ATOMICS
+#endif
+
+__host__ __device__
+uint32_t isLocal(const void* const ptr) {
+#ifdef __CUDA_ARCH__
+    uint32_t islocal = 0;
+    asm volatile ("{ \n\t"
+                  "    .reg .pred p; \n\t"
+                  "    isspacep.local p, %1; \n\t"
+                  "    selp.u32 %0, 1, 0, p;  \n\t"
+                  "} \n\t" : "=r"(islocal) : "l"(ptr));
+    return islocal;
+#else
+    return false;
+#endif
+}
 
 __host__ __device__
 uint32_t heterogeneousLog2(uint32_t val) {
