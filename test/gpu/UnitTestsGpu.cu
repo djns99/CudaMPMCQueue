@@ -1,6 +1,6 @@
 #include "GpuTestHeader.cuh"
 
-GPU_TEST_P(MPMCGpuTests, PushIncreaseSize) {
+GPU_TEST_P_NO_SYNC(MPMCGpuTests, PushIncreaseSize) {
     assert(num_threads == 1);
 
     for(uint64_t i = 0; i < capacity; i++) {
@@ -10,7 +10,7 @@ GPU_TEST_P(MPMCGpuTests, PushIncreaseSize) {
     }
 }
 
-GPU_TEST_P(MPMCGpuTests, PopDecreaseSize) {
+GPU_TEST_P_NO_SYNC(MPMCGpuTests, PopDecreaseSize) {
     assert(num_threads == 1);
 
     for(uint64_t i = 0; i < capacity; i++) {
@@ -25,7 +25,7 @@ GPU_TEST_P(MPMCGpuTests, PopDecreaseSize) {
     GPU_ASSERT_EQ(queue->size_approx(), 0);
 }
 
-GPU_TEST_P(MPMCGpuTests, PushPopOrdering) {
+GPU_TEST_P_NO_SYNC(MPMCGpuTests, PushPopOrdering) {
     assert(num_threads == 1);
 
     for(uint64_t i = 0; i < capacity; i++) {
@@ -52,7 +52,7 @@ GPU_TEST_P(MPMCGpuTests, PushPopOrdering) {
     GPU_ASSERT_EQ(queue->size_approx(), 0);
 }
 
-GPU_TEST_P(MPMCGpuTests, UsePoppedSpaces) {
+GPU_TEST_P_NO_SYNC(MPMCGpuTests, UsePoppedSpaces) {
     assert(num_threads == 1);
 
     // Fill then empty same q multiple times
@@ -82,7 +82,7 @@ GPU_TEST_P(MPMCGpuTests, UsePoppedSpaces) {
     }
 }
 
-GPU_TEST_P(MPMCGpuTests, PopHalfFull) {
+GPU_TEST_P_NO_SYNC(MPMCGpuTests, PopHalfFull) {
     assert(num_threads == 1);
 
     // Fill then empty same q multiple times
@@ -107,7 +107,7 @@ GPU_TEST_P(MPMCGpuTests, PopHalfFull) {
     GPU_ASSERT_EQ(queue->size_approx(), 0);
 }
 
-GPU_TEST_P(MPMCGpuTests, PushPopDecreasingNum) {
+GPU_TEST_P_NO_SYNC(MPMCGpuTests, PushPopDecreasingNum) {
     assert(num_threads == 1);
 
     uint64_t amount = capacity;

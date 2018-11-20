@@ -1,13 +1,24 @@
 #include "CudaMPMCQueue.cuh"
 #include <gtest/gtest.h>
+#include <cooperative_groups.h>
+#include <cuda_runtime.h>
+#include <cuda.h>
 
 using namespace CudaMPMCQueue;
+using namespace cooperative_groups;
 
 __managed__ cuAtomic<uint64_t>* GPU_GTEST_FAILURE = nullptr;
 
 
 // Prints first failure
-#define GPU_ASSERT_TRUE_BASE(expr, ...) if(!(expr)) { if(!GPU_GTEST_FAILURE->atomic_add(1ul)) { printf("%s:%d: %s\n", __FILE__, __LINE__, __VA_ARGS__); } return; }
+#define GPU_ASSERT_TRUE_BASE(expr, ...) if(!(expr)) { \
+		                                    if(!GPU_GTEST_FAILURE->atomic_add(1ul)) { \
+                                                printf("%s:%d: %s\n", __FILE__, __LINE__, __VA_ARGS__); \
+                                            } \
+                                            return; \
+                                        } else if (GPU_GTEST_FAILURE->value()) { \
+                                            return; \
+                                        }
 #define GPU_ASSERT_TRUE(expr, ...) GPU_ASSERT_TRUE_BASE(expr, #expr " was not true" "\n" __VA_ARGS__)
 #define GPU_ASSERT_FALSE(expr, ...) GPU_ASSERT_TRUE_BASE(!(expr), #expr " was not false" "\n" __VA_ARGS__)
 #define GPU_ASSERT_EQ(a, b, ...) GPU_ASSERT_TRUE_BASE((a) == (b), #a " == " #b " Failed" "\n" __VA_ARGS__)
@@ -17,29 +28,66 @@ __managed__ cuAtomic<uint64_t>* GPU_GTEST_FAILURE = nullptr;
 #define GPU_ASSERT_GE(a, b, ...) GPU_ASSERT_TRUE_BASE((a) >= (b), #a " >= " #b " Failed" "\n" __VA_ARGS__)
 #define GPU_ASSERT_GT(a, b, ...) GPU_ASSERT_TRUE_BASE((a) > (b), #a " > " #b " Failed" "\n" __VA_ARGS__)
 
-#define RUN_KERNEL(kernel) \
-if(GPU_GTEST_FAILURE) {cudaFree(GPU_GTEST_FAILURE);} \
-cudaMallocManaged(&GPU_GTEST_FAILURE, sizeof(cuAtomic<uint64_t>)); \
-new(GPU_GTEST_FAILURE) cuAtomic<uint64_t>(0); \
-kernel<<<blocks, threads>>>(queue, capacity, num_threads); \
-ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess) << "CUDA error"; \
-ASSERT_EQ(GPU_GTEST_FAILURE->value(), 0) << GPU_GTEST_FAILURE->value() << " threads failed";
+#define RUN_KERNEL(kernel, sync) \
+    if(GPU_GTEST_FAILURE) {cudaFree(GPU_GTEST_FAILURE);} \
+    cudaMallocManaged(&GPU_GTEST_FAILURE, sizeof(cuAtomic<uint64_t>)); \
+    new(GPU_GTEST_FAILURE) cuAtomic<uint64_t>(0); \
+    if (sync) { \
+        void* args[] = {(void*)&queue, (void*)&capacity, (void*)&num_threads }; \
+        int occupancy; cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occupancy, kernel, threads, 0); \
+        int dev; cudaGetDevice(&dev); \
+        cudaDeviceProp deviceProp; cudaGetDeviceProperties(&deviceProp, dev); \
+        ASSERT_LE(ceil_div<uint64_t>(blocks, occupancy), deviceProp.multiProcessorCount) << "Too many threads"; \
+        ASSERT_EQ(cudaLaunchCooperativeKernel((void*)kernel, blocks, threads, args), cudaSuccess) << "Launch failed"; \
+    } else { \
+        kernel<<<blocks, threads>>>(queue, capacity, num_threads); \
+    } \
+    auto err = cudaDeviceSynchronize(); /* Check error after checking ASSERT flag */ \
+    ASSERT_EQ(GPU_GTEST_FAILURE->value(), 0) << GPU_GTEST_FAILURE->value() << " threads failed"; \
+    ASSERT_EQ(err, cudaSuccess) << "CUDA error";
 
 // Declare test running as a device function
 #define GPU_TEST_P(cls, test) \
-__device__ void device_##test(MPMCQueue<uint64_t>*, uint64_t, uint32_t);\
+__device__ void device_##test(MPMCQueue<uint64_t>*, uint64_t, uint32_t, grid_group, uint32_t);\
+__device__ MPMCQueue<uint64_t>* q_##test; \
 __global__ void kernel_##test(MPMCQueue<uint64_t>* q, uint64_t c, uint32_t n){ \
-	if(threadIdx.x + blockIdx.x * blockDim.x >= n) {return;} \
+    grid_group g = this_grid(); \
+    uint32_t t = g.thread_rank(); \
+	if(t >= n) {return;} \
 	bool alloc = false; \
-	if(q == nullptr) { q = MPMCQueue<uint64_t>::allocHeterogeneousMPMCQueue(c); alloc = true; } \
-    device_##test(q, c, n); \
+	if(q == nullptr) { \
+		if(t == 0) { \
+		    q_##test = MPMCQueue<uint64_t>::allocHeterogeneousMPMCQueue(c); \
+		} \
+		g.sync(); \
+		q = q_##test; \
+		alloc = true; \
+	} \
+    device_##test(q, c, n, g, t); \
+    g.sync(); \
+    if(alloc && t == 0) { MPMCQueue<uint64_t>::freeHeterogeneousMPMCQueue(q); } \
+} \
+TEST_P(cls, test) { \
+    init(); \
+    RUN_KERNEL(kernel_##test, true) \
+} \
+__device__ void device_##test(MPMCQueue<uint64_t>* queue, uint64_t capacity, uint32_t num_threads, grid_group grid, uint32_t tid)
+
+#define GPU_TEST_P_NO_SYNC(cls, test) \
+__device__ void device_##test(MPMCQueue<uint64_t>*, uint64_t, uint32_t, uint32_t);\
+__global__ void kernel_##test(MPMCQueue<uint64_t>* q, uint64_t c, uint32_t n){ \
+    uint32_t t = threadIdx.x + blockDim.x * blockIdx.x; \
+    if(t >= n) {return;} \
+    bool alloc = false; \
+    if(q == nullptr) { q = MPMCQueue<uint64_t>::allocHeterogeneousMPMCQueue(c); alloc = true; } \
+    device_##test(q, c, n, t); \
     if(alloc) { MPMCQueue<uint64_t>::freeHeterogeneousMPMCQueue(q); } \
 }\
 TEST_P(cls, test) { \
     init(); \
-    RUN_KERNEL(kernel_##test) \
+    RUN_KERNEL(kernel_##test, false) \
 } \
-__device__ void device_##test(MPMCQueue<uint64_t>* queue, uint64_t capacity, uint32_t num_threads)
+__device__ void device_##test(MPMCQueue<uint64_t>* queue, uint64_t capacity, uint32_t num_threads, uint32_t tid)
 
 class MPMCGpuTests : public ::testing::TestWithParam<std::tuple<uint64_t, uint32_t, bool>> {
 protected:

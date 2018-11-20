@@ -1,1 +1,2 @@
 setup_test(UnitTestsGpu)
+setup_test(ThreadedTestsGpu)
