@@ -25,15 +25,17 @@ GPU_TEST_P(MPMCGpuTests, PushPartCapacityEach) {
         push_func(queue, tid, capacity * j, num, num_threads);
 
         grid.sync();
-
         queue->try_sync();
+        grid.sync();
+
         GPU_ASSERT_EQ(queue->size_approx(), capacity, "Not enough values pushed");
 
         pop_func(queue, tid, capacity * j, capacity * (j+1) - 1, num);
 
         grid.sync();
-
         queue->try_sync();
+        grid.sync();
+
         GPU_ASSERT_EQ(queue->size_approx(), 0, "Not enough values popped");
 
         grid.sync();
@@ -53,30 +55,34 @@ GPU_TEST_P(MPMCGpuTests, PushSyncPop) {
     push_func(queue, tid, 0, num, num_threads);
 
     grid.sync();
-
     queue->try_sync();
+    grid.sync();
+
     GPU_ASSERT_EQ(queue->size_approx(), half_capacity, "Not enough values pushed");
 
     push_func(queue, tid, half_capacity, num, num_threads);
 
     grid.sync();
-
     queue->try_sync();
+    grid.sync();
+
     GPU_ASSERT_EQ(queue->size_approx(), half_capacity * 2, "Not enough values pushed");
 
-    // Relative ordering not guaranteed. Check popped values are from first batch
+    // Relative ordering not guaranteed. Just check popped values are from first batch
     pop_func(queue, tid, 0, half_capacity - 1, num);
 
     grid.sync();
-
     queue->try_sync();
+    grid.sync();
+
     GPU_ASSERT_EQ(queue->size_approx(), half_capacity, "Not enough values popped");
 
     pop_func(queue, tid, half_capacity, half_capacity * 2 - 1, num);
 
     grid.sync();
-
     queue->try_sync();
+    grid.sync();
+
     GPU_ASSERT_EQ(queue->size_approx(), 0, "Not enough values popped");
 }
 
@@ -84,34 +90,20 @@ GPU_TEST_P(MPMCGpuTests, PushSyncPop) {
  * Test high contention scenario where all threads are trying to produce/consume capacity elements.
  */
 GPU_TEST_P(MPMCGpuTests, PushPopCapacityEach) {
+    bool pushing = true;
+
     for(uint64_t i = 0; i < capacity; ) {
-        if(queue->try_push(tid)) { // Allow threads to re-converge to avoid deadlocks
-            auto val = queue->pop();
+        // Use try_* methods to allow threads to re-converge and avoid deadlocks
+        if(pushing && queue->try_push(tid)) {
+            pushing = false;
+        }
+
+        optional<uint64_t> val;
+        if(!pushing && (val = queue->try_pop())) {
+            pushing = true;
             GPU_ASSERT_LT(val, num_threads, "Invalid value popped");
             i++;
         }
-    }
-}
-
-/*
- * If we aren't careful warp cooperation could end up mutating the wrong object
- * Do a basic test to verify locally owned objects are not leaking into other threads
- */
-GPU_TEST_P_NO_SYNC(MPMCGpuTests, LocalIsLocal) {
-    MPMCQueue<uint64_t> local(capacity);
-    for(size_t i = 0; i < capacity; i++) {
-        GPU_ASSERT_EQ(local.size_approx(), i, "Size did not match expected");
-        bool push = local.try_push(tid*capacity + i);
-        GPU_ASSERT_TRUE(push, "Failed to push");
-        local.try_sync();
-    }
-
-    for(size_t i = 0; i < capacity; i++) {
-        GPU_ASSERT_EQ(local.size_approx(), capacity - i - 1, "Size did not match expected");
-        auto res = local.try_pop();
-        GPU_ASSERT_TRUE(res.has_value(), "Failed to pop");;
-        GPU_ASSERT_EQ(res.value(), tid*capacity + i, "Incorrect value popped");
-        local.try_sync();
     }
 }
 

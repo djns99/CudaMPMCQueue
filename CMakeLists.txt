@@ -19,6 +19,6 @@ include_directories(include)
 
 cuda_select_nvcc_arch_flags(ARCH_FLAGS Auto)
 message("Using compute ${ARCH_FLAGS}")
-list(APPEND CUDA_NVCC_FLAGS ${ARCH_FLAGS} )
+list(APPEND CUDA_NVCC_FLAGS ${ARCH_FLAGS})
 
 add_subdirectory(test)

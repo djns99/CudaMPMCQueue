@@ -99,7 +99,7 @@ public:
 
 template<class T>
 class cuAtomic {
-public:
+private:
     T _ctr;
     const bool _is_local;
 public:

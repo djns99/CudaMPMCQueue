@@ -315,7 +315,7 @@ uint32_t ffs(uint32_t val)
 
 template<typename T>
 __host__ __device__
-uint64_t MPMCQueue<T>::mod_capacity(uint64_t val) const {
+uint64_t MPMCQueue<T>::mod_capacity(const uint64_t val) const {
     return (_can_fast_mod) ? (val & _fast_mod_mask) : (val % _capacity);
 }
 
@@ -504,14 +504,16 @@ bool MPMCQueue<T>::try_clear_tail()
     return new_tail_opt.has_value();
 }
 
-template<class T>
-__device__ uint32_t match_any_sync(uint32_t mask, const MPMCQueue<T>* const p) {
+__device__ uint32_t match_any_sync(uint32_t mask, uint64_t val) {
 #if __CUDA_ARCH__ >= 700
-    return __match_any_sync(mask, p);
+    return __match_any_sync(mask, val);
 #else
     uint32_t out_mask = 0x0;
-    for(uint32_t i = 0; i < 32; i++) // TODO 32 - __clz(mask)?
-        out_mask |= ((mask & (1 << i)) && (__shfl_sync(mask, (uintptr_t)p, i) == (uintptr_t)p)) << i;
+    for(uint32_t i = 0; i < 32; i++) { // TODO 32 - __clz(mask)?
+        if(mask & (1 << i)) {
+            out_mask |= (__shfl_sync(mask, val, i) == val) << i;
+        }
+    }
     return out_mask;
 #endif
 }
@@ -524,7 +526,7 @@ uint32_t MPMCQueue<T>::get_active_mask() const {
     }
 
     uint32_t active_mask = __activemask();
-    return match_any_sync(active_mask, this);
+    return match_any_sync(active_mask, (uint64_t)this);
 }
 
 template<typename T>
@@ -685,6 +687,7 @@ optional<T> MPMCQueue<T>::try_pop_internal_warp(uint32_t active_mask)
     {
         // Wrap if necessary
         uint32_t myidx = (tid >= wrap_tid) ? tid - wrap_tid : idx + tid;
+        assert(myidx < _capacity);
         out = _data[myidx];
     }
     __syncwarp(active_mask);
