@@ -88,6 +88,8 @@ public:
      * Attempts to resolve all uncertainties regarding sizes
      * If called from a single thread (i.e. with no other threads mutating the object),
      * it is guaranteed that subsequent calls to size_approx() will be correct until the next push or pop
+     *
+     * Returns a hint as to whether sizes may have changed
      */
     __host__ __device__ bool try_sync();
 

@@ -1,0 +1,2 @@
+setup_bench(SingleThreadedBenchmarksGPU)
+setup_bench(MultiThreadedBenchmarksGPU)

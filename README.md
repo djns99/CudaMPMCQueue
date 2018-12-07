@@ -6,7 +6,7 @@
 
 In order to use CudaMPMCQueue you should have cuda 10 installed.
 
-In order to build the tests you will require cmake and gtest.
+In order to build the tests you will require cmake, gtest and google benchmark.
 
 For CMake:
 

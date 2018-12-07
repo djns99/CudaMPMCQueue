@@ -22,3 +22,4 @@ message("Using compute ${ARCH_FLAGS}")
 list(APPEND CUDA_NVCC_FLAGS ${ARCH_FLAGS})
 
 add_subdirectory(test)
+add_subdirectory(bench)
