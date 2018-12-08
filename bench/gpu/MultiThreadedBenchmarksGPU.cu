@@ -56,7 +56,7 @@ void PushPartEach(benchmark::State& state) {
     for(auto _ : state) {
         const size_t num_ops = capacity / num_threads;
         START_TIMING
-        PushPartEach<<<threads_per_block, num_blocks>>>(queue, num_ops);
+        PushPartEach<<<num_blocks, threads_per_block>>>(queue, num_ops);
         STOP_TIMING
 
         CLEAR_QUEUE
@@ -78,7 +78,7 @@ void PopPartEach(benchmark::State& state) {
         FILL_QUEUE
 
         START_TIMING
-        PopPartEach<<<threads_per_block, num_blocks>>>(queue, num_ops);
+        PopPartEach<<<num_blocks, threads_per_block>>>(queue, num_ops);
         STOP_TIMING
     }
 
@@ -96,7 +96,7 @@ void PushPopPartEach(benchmark::State& state) {
         const size_t num_ops = capacity / num_threads;
 
         START_TIMING
-        PushPopPartEach<<<threads_per_block, num_blocks>>>(queue, num_ops);
+        PushPopPartEach<<<num_blocks, threads_per_block>>>(queue, num_ops);
         STOP_TIMING
     }
 
@@ -114,7 +114,7 @@ void InterleavedPushPopPartEach(benchmark::State& state) {
         const size_t num_ops = capacity / num_threads;
 
         START_TIMING
-        InterleavedPushPopPartEach<<<threads_per_block, num_blocks>>>(queue, num_ops);
+        InterleavedPushPopPartEach<<<num_blocks, threads_per_block>>>(queue, num_ops);
         STOP_TIMING
     }
 
@@ -130,7 +130,7 @@ void PushPopFullContention(benchmark::State& state) {
 
     for(auto _ : state) {
         START_TIMING
-        PushPopFullContention<<<threads_per_block, num_blocks>>>(queue);
+        PushPopFullContention<<<num_blocks, threads_per_block>>>(queue);
         STOP_TIMING
     }
 
