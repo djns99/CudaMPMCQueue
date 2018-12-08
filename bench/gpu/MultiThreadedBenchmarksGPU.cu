@@ -128,10 +128,14 @@ void PushPopFullContention(benchmark::State& state) {
 
     SETUP_BENCHMARK_THREADED
 
-    for(auto _ : state) {
-        START_TIMING
-        PushPopFullContention<<<num_blocks, threads_per_block>>>(queue);
-        STOP_TIMING
+    if(use_warps || num_threads * capacity <= (1u<<26)) {
+        for(auto _ : state) {
+            START_TIMING
+            PushPopFullContention<<<num_blocks, threads_per_block>>>(queue);
+            STOP_TIMING
+        }
+    } else {
+        state.SetLabel("Too Slow. Skipped");
     }
 
     CLEANUP_BENCHMARK_THREADED
