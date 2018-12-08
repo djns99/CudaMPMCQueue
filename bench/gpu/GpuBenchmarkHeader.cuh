@@ -11,8 +11,9 @@
 #define SETUP_BENCHMARK_THREADED \
     SETUP_BENCHMARK \
     const size_t num_threads = state.range(1); \
-    const size_t threads_per_block = std::min(256ul, num_threads); \
-    const size_t num_blocks = (threads_per_block + (num_threads - 1)) / num_threads;
+    const bool use_warps = state.range(2); \
+    const size_t threads_per_block = use_warps ? std::min(256ul, num_threads) : 1; \
+    const size_t num_blocks = use_warps ? ((threads_per_block + (num_threads - 1)) / num_threads) : num_threads;
 
 #define CLEANUP_BENCHMARK \
     state.counters["Capacity"] = capacity; \
@@ -21,6 +22,7 @@
 
 #define CLEANUP_BENCHMARK_THREADED \
     state.counters["Num Threads"] = num_threads; \
+    if(use_warps) { state.SetLabel("Using Warp Optimizations"); } \
     CLEANUP_BENCHMARK
 
 #define START_TIMING \

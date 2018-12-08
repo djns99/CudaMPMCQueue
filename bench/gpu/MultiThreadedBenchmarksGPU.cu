@@ -145,7 +145,10 @@ void ArgsGenerator(benchmark::internal::Benchmark* b) {
     for( const uint32_t num_threads : num_threads_vec ) {
         for( const uint32_t capacity : capacities_vec ) {
             if(num_threads <= capacity) {
-                b->Args({capacity, num_threads});
+                b->Args({capacity, num_threads, 0});
+                if(num_threads >= 1) {
+                    b->Args({capacity, num_threads, 1});
+                }
             }
         }
     }
@@ -155,6 +158,6 @@ BENCHMARK(PushPartEach)->UseManualTime()->Apply(ArgsGenerator);
 BENCHMARK(PopPartEach)->UseManualTime()->Apply(ArgsGenerator);
 BENCHMARK(PushPopPartEach)->UseManualTime()->Apply(ArgsGenerator);
 BENCHMARK(InterleavedPushPopPartEach)->UseManualTime()->Apply(ArgsGenerator);
-BENCHMARK(PushPopFullContention)->UseManualTime()->RangeMultiplier(32)->Ranges({{1, 1<<20}, {1, 65536}});
+BENCHMARK(PushPopFullContention)->UseManualTime()->RangeMultiplier(32)->Ranges({{1, 1<<20}, {1, 65536}, {0, 1}});
 
 BENCHMARK_MAIN();
