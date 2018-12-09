@@ -510,13 +510,32 @@ __device__ uint32_t match_any_sync(uint32_t mask, uint64_t val) {
 #if __CUDA_ARCH__ >= 700
     return __match_any_sync(mask, val);
 #else
+    __shared__ uint64_t store[32];
+    store[threadIdx.x & 31] = val;
+
     uint32_t out_mask = 0x0;
-    for(uint32_t i = 0; i < 32; i++) { // TODO 32 - __clz(mask)?
+
+    // Unroll adds ~6% performance for optimal use case (full warp cooperation).
+    // So we use fixed size loop rather than early termination (e.g. 32 - __clz(mask))
+#pragma unroll
+    for(uint32_t i = 0; i < 32; i++) {
+        if(mask & (1 << i)) {
+            // Vectorised loads caused performance decrease
+            out_mask |= (store[i] == val) << i;
+        }
+    }
+    return out_mask;
+
+    // Using shared memory ~2x faster than __shfl_sync
+    /*
+    uint32_t out_mask = 0x0;
+    for(uint32_t i = 0; i < 32 - __clz(mask); i++) { // TODO 32 - __clz(mask)?
         if(mask & (1 << i)) {
             out_mask |= (__shfl_sync(mask, val, i) == val) << i;
         }
     }
     return out_mask;
+    */
 #endif
 }
 
@@ -845,8 +864,12 @@ bool MPMCQueue<T>::try_clear_head_warp()
     assert(!_is_local);
 
     uint32_t active_mask = get_active_mask();
-    if (!__any_sync(active_mask, _updating_head.try_lock())) // Did this warp obtain the bitmap
-        return false;
+
+    uint32_t tid0 = ffs(active_mask) - 1;
+    bool is_tid0 = tid0 == (threadIdx.x & 31);
+    // Only attempt lock on one thread
+    if (!__shfl_sync(active_mask, is_tid0 && _updating_head.try_lock(), tid0))
+        return false; // Another warp is modifying the bitmap
     // Warp has exclusive access to bitmap between head_safe and head_unsafe
     uint64_t old = _head_safe;
     optional<uint64_t> new_head_opt = try_clear_range_warp<true>(_head_safe, _head_unsafe.value(), active_mask);
@@ -868,7 +891,7 @@ bool MPMCQueue<T>::try_clear_head_warp()
 #endif
     }
 
-    if ((ffs(active_mask) - 1) == (threadIdx.x & 31))
+    if (is_tid0)
         _updating_head.unlock();
 
     // All threads return if we successfully advanced head
@@ -882,8 +905,12 @@ bool MPMCQueue<T>::try_clear_tail_warp()
     assert(!_is_local);
 
     uint32_t active_mask = get_active_mask();
-    if (!__any_sync(active_mask, _updating_tail.try_lock())) // Did this warp obtain the bitmap
-        return false;
+
+    uint32_t tid0 = ffs(active_mask) - 1;
+    bool is_tid0 = tid0 == (threadIdx.x & 31);
+    // Only attempt lock on one thread
+    if (!__shfl_sync(active_mask, is_tid0 && _updating_tail.try_lock(), tid0))
+        return false; // Another warp is modifying the bitmap
     // Warp has exclusive access to bitmap between tail_safe and tail_unsafe
     uint64_t old = _tail_safe;
     optional<uint64_t> new_tail_opt = try_clear_range_warp<false>(_tail_safe, _tail_unsafe.value(), active_mask);
@@ -905,7 +932,7 @@ bool MPMCQueue<T>::try_clear_tail_warp()
         }
 #endif
     }
-    if ((ffs(active_mask) - 1) == (threadIdx.x & 31))
+    if (is_tid0)
         _updating_tail.unlock();
     // All threads return if we successfully advanced tail
     return __any_sync(active_mask, new_tail_opt.has_value());

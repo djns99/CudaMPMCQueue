@@ -13,7 +13,7 @@
     const size_t num_threads = state.range(1); \
     const bool use_warps = state.range(2); \
     const size_t threads_per_block = use_warps ? std::min(256ul, num_threads) : 1; \
-    const size_t num_blocks = use_warps ? ((threads_per_block + (num_threads - 1)) / num_threads) : num_threads;
+    const size_t num_blocks = use_warps ? ((num_threads + (threads_per_block - 1)) / threads_per_block) : num_threads;
 
 #define CLEANUP_BENCHMARK \
     state.counters["Capacity"] = capacity; \

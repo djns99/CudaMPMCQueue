@@ -7,10 +7,6 @@
 
 namespace CudaMPMCQueue {
 
-#ifndef NO_SYSTEM_ATOMICS
-#define USE_SYSTEM_ATOMICS
-#endif
-
 __host__ __device__
 uint32_t isLocal(const void* const ptr) {
 #ifdef __CUDA_ARCH__

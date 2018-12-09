@@ -9,11 +9,22 @@ find_package(CUDA 10.0 REQUIRED)
 set( CUDA_SEPARABLE_COMPILATION ON )
 message(STATUS "Found CUDA ${CUDA_VERSION_STRING} at ${CUDA_TOOLKIT_ROOT_DIR}")
 
+option(USE_SYSTEM_ATOMICS "If atomic functions in tests should use atomic*_system" OFF)
+option(AVOID_OVERFLOWS "If tests should have overflow avoidance on" ON)
+
+if(USE_SYSTEM_ATOMICS)
+	add_definitions(-DUSE_SYSTEM_ATOMICS)
+endif()
+
+if(AVOID_OVERFLOWS)
+	add_definitions(-DAVOID_OVERFLOWS)
+endif()
+
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 set(CMAKE_CXX_FLAGS -std=c++11)
 
 set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -Wall -Werror -g")
-set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -Wall -Werror -03")
+set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -Wall -Werror -O3")
 
 include_directories(include)
 
