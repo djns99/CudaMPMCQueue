@@ -153,7 +153,7 @@ public:
         } else {
             // Local var. No atomics
             out = _ctr;
-            _ctr += val;
+            _ctr -= val;
         }
         // Crude catch for wrapping.
         assert(out > INT64_MAX + val || out < INT64_MAX);

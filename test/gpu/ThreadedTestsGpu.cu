@@ -1,14 +1,15 @@
 #include "GpuTestHeader.cuh"
 
-__device__ void push_func(MPMCQueue<uint64_t>* queue, uint64_t id, uint64_t start_val, uint32_t num, uint32_t step) {
+__device__ void push_func(MPMCQueue<uint64_t>* queue, uint64_t id, uint64_t start_val, uint32_t num, uint32_t step, uint32_t active_mask) {
     for(uint64_t i = 0; i < num; i++) {
         queue->push(start_val + id + step*i);
     }
 }
 
-__device__ void pop_func(MPMCQueue<uint64_t>* queue, uint64_t id, uint64_t min, uint64_t max, uint32_t num) {
+__device__ void pop_func(MPMCQueue<uint64_t>* queue, uint64_t id, uint64_t min, uint64_t max, uint32_t num, uint32_t active_mask) {
+
     for(uint64_t i = 0; i < num; i++) {
-        auto val = queue->pop();
+        auto val = queue->pop(active_mask);
         GPU_ASSERT_GE(val, min, "Value was less than min");
         GPU_ASSERT_LE(val, max, "Value was greater than max");
     }
@@ -22,18 +23,18 @@ GPU_TEST_P(MPMCGpuTests, PushPartCapacityEach) {
     num += (tid < extra_op_thresh);
     for(uint32_t j = 0; j < 5; j++) {
 
-        push_func(queue, tid, capacity * j, num, num_threads);
+        push_func(queue, tid, capacity * j, num, num_threads, active_mask);
 
         grid.sync();
-        queue->try_sync();
+        queue->try_sync(active_mask);
         grid.sync();
 
         GPU_ASSERT_EQ(queue->size_approx(), capacity, "Not enough values pushed");
 
-        pop_func(queue, tid, capacity * j, capacity * (j+1) - 1, num);
+        pop_func(queue, tid, capacity * j, capacity * (j+1) - 1, num, active_mask);
 
         grid.sync();
-        queue->try_sync();
+        queue->try_sync(active_mask);
         grid.sync();
 
         GPU_ASSERT_EQ(queue->size_approx(), 0, "Not enough values popped");
@@ -52,35 +53,35 @@ GPU_TEST_P(MPMCGpuTests, PushSyncPop) {
     uint32_t num = op_per_thread;
     num += (tid < extra_op_thresh);
 
-    push_func(queue, tid, 0, num, num_threads);
+    push_func(queue, tid, 0, num, num_threads, active_mask);
 
     grid.sync();
-    queue->try_sync();
+    queue->try_sync(active_mask);
     grid.sync();
 
     GPU_ASSERT_EQ(queue->size_approx(), half_capacity, "Not enough values pushed");
 
-    push_func(queue, tid, half_capacity, num, num_threads);
+    push_func(queue, tid, half_capacity, num, num_threads, active_mask);
 
     grid.sync();
-    queue->try_sync();
+    queue->try_sync(active_mask);
     grid.sync();
 
     GPU_ASSERT_EQ(queue->size_approx(), half_capacity * 2, "Not enough values pushed");
 
     // Relative ordering not guaranteed. Just check popped values are from first batch
-    pop_func(queue, tid, 0, half_capacity - 1, num);
+    pop_func(queue, tid, 0, half_capacity - 1, num, active_mask);
 
     grid.sync();
-    queue->try_sync();
+    queue->try_sync(active_mask);
     grid.sync();
 
     GPU_ASSERT_EQ(queue->size_approx(), half_capacity, "Not enough values popped");
 
-    pop_func(queue, tid, half_capacity, half_capacity * 2 - 1, num);
+    pop_func(queue, tid, half_capacity, half_capacity * 2 - 1, num, active_mask);
 
     grid.sync();
-    queue->try_sync();
+    queue->try_sync(active_mask);
     grid.sync();
 
     GPU_ASSERT_EQ(queue->size_approx(), 0, "Not enough values popped");
@@ -94,12 +95,12 @@ GPU_TEST_P(MPMCGpuTests, PushPopCapacityEach) {
 
     for(uint64_t i = 0; i < capacity; ) {
         // Use try_* methods to allow threads to re-converge and avoid deadlocks
-        if(pushing && queue->try_push(tid)) {
+        if(pushing && queue->try_push(tid, active_mask)) {
             pushing = false;
         }
 
         optional<uint64_t> val;
-        if(!pushing && (val = queue->try_pop())) {
+        if(!pushing && (val = queue->try_pop(active_mask))) {
             pushing = true;
             GPU_ASSERT_LT(val, num_threads, "Invalid value popped");
             i++;
@@ -109,7 +110,7 @@ GPU_TEST_P(MPMCGpuTests, PushPopCapacityEach) {
 
 INSTANTIATE_TEST_CASE_P(MPMCGpuTests,
                         MPMCGpuTests,
-                        ::testing::Combine(::testing::Values(1, 10, 65536, 65537, 128*1024), ::testing::Values(256, 1024), ::testing::Bool()));
+                        ::testing::Combine(::testing::Values(1, 10, 65536, 65537, 128*1024), ::testing::Values(256, 1024), ::testing::Bool(), ::testing::Bool()));
 
 int main(int argc, char **argv) {
   ::testing::InitGoogleTest(&argc, argv);

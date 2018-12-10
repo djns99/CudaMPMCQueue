@@ -12,6 +12,7 @@ namespace CudaMPMCQueue {
 
 // Enable if the queue will be in prolonged usage
 // Avoids uint64_t overflows by reducing the counters when clearing head/tail
+// May lead to less accurate results for size_approx
 // #define AVOID_OVERFLOWS 1
 
 /*
@@ -48,7 +49,7 @@ public:
      *
      * Returns true if we successfully found a free slot
      */
-    __host__ __device__ bool try_push(T val);
+    __host__ __device__ bool try_push(T val, uint32_t active_mask = 0);
     /*
      * Blocks until method can successfully push value onto the queue.
      *
@@ -57,13 +58,13 @@ public:
      * WARNING: Only use this if you know all calling threads in the warp will succeed.
      *          Otherwise this may result in deadlock.
      */
-    __host__ __device__ void push(T val);
+    __host__ __device__ void push(T val, uint32_t active_mask = 0);
     /*
      * Try to pop a value from the queue
      *
      * Returns optional<> that has value set if a value was popped
      */
-    __host__ __device__ optional<T> try_pop();
+    __host__ __device__ optional<T> try_pop(uint32_t active_mask = 0);
     /*
      * Blocks until method can successfully pop a value from the queue
      *
@@ -72,7 +73,7 @@ public:
      * WARNING: Only use this if you know all calling threads in the warp will succeed.
      *          Otherwise this may result in deadlock.
      */
-    __host__ __device__ T pop();
+    __host__ __device__ T pop(uint32_t active_mask = 0);
 
     /*
      * Get the capacity of the queue
@@ -91,7 +92,17 @@ public:
      *
      * Returns a hint as to whether sizes may have changed
      */
-    __host__ __device__ bool try_sync();
+    __host__ __device__ bool try_sync(uint32_t active_mask = 0);
+
+    /**
+     * Returns an active mask of all threads in the warp that are operating on the same object
+     * This is expensive to run every push or pop.
+     * Instead this method can be called once and the mask passed to methods.
+     *
+     * NOTE: This mask can still be used when divergent push/pops are called.
+     * The active subset will automatically be extracted when each method is called
+     */
+    __device__ uint32_t register_warp() const;
 
     /*
      * Heterogeneously allocates the object using cudaMallocManaged from the host
@@ -112,16 +123,16 @@ private:
     __host__ __device__ uint64_t mod_capacity(uint64_t val) const;
     __host__ __device__ uint64_t div_capacity(uint64_t val) const;
 
-    __host__ __device__ bool try_push_internal(T val);
-    __host__ __device__ optional<T> try_pop_internal();
+    __host__ __device__ bool try_push_internal(T val, uint32_t active_mask);
+    __host__ __device__ optional<T> try_pop_internal(uint32_t active_mask);
 
     template<bool flip>
     __host__ __device__ optional<uint64_t> try_clear_range(uint64_t start, uint64_t end) const;
 
-    __host__ __device__ bool try_clear_head();
-    __host__ __device__ bool try_clear_tail();
+    __host__ __device__ bool try_clear_head(uint32_t active_mask);
+    __host__ __device__ bool try_clear_tail(uint32_t active_mask);
 
-    __device__ uint32_t get_active_mask() const;
+    __device__ uint32_t get_active_mask(uint32_t active_mask) const;
 
     __device__ bool try_push_internal_warp(T val, uint32_t active_mask);
 
@@ -130,8 +141,8 @@ private:
     template<bool flip>
     __device__ optional<uint64_t> try_clear_range_warp(uint64_t start, uint64_t end, uint32_t active_mask) const;
 
-    __device__ bool try_clear_head_warp();
-    __device__ bool try_clear_tail_warp();
+    __device__ bool try_clear_head_warp(uint32_t active_mask);
+    __device__ bool try_clear_tail_warp(uint32_t active_mask);
 
     const uint64_t _capacity;
     const uint64_t _capacity_log;
@@ -195,11 +206,11 @@ __host__ __device__ MPMCQueue<T>::~MPMCQueue()
 
 template<typename T>
 __host__ __device__
-bool MPMCQueue<T>::try_push(T val)
+bool MPMCQueue<T>::try_push(T val, uint32_t active_mask)
 {
 #ifdef __CUDA_ARCH__
     if(!_is_local) {
-        uint32_t mask = get_active_mask();
+        uint32_t mask = get_active_mask(active_mask);
         uint32_t active_count = __popc(mask);
         if (active_count >= _use_warp)
         {
@@ -207,24 +218,24 @@ bool MPMCQueue<T>::try_push(T val)
         }
     }
 #endif
-    return try_push_internal(val);
+    return try_push_internal(val, active_mask);
 }
 
 template<typename T>
 __host__ __device__
-void MPMCQueue<T>::push(T val)
+void MPMCQueue<T>::push(T val, uint32_t active_mask)
 {
-    while (!try_push(val))
+    while (!try_push(val, active_mask))
         ;
 }
 
 template<typename T>
 __host__ __device__
-optional<T> MPMCQueue<T>::try_pop()
+optional<T> MPMCQueue<T>::try_pop(uint32_t active_mask)
 {
 #ifdef __CUDA_ARCH__
     if(!_is_local) {
-        uint32_t mask = get_active_mask();
+        uint32_t mask = get_active_mask(active_mask);
         uint32_t active_count = __popc(mask);
         if (active_count >= _use_warp)
         {
@@ -232,15 +243,15 @@ optional<T> MPMCQueue<T>::try_pop()
         }
     }
 #endif
-    return try_pop_internal();
+    return try_pop_internal(active_mask);
 }
 
 template<typename T>
 __host__ __device__
-T MPMCQueue<T>::pop()
+T MPMCQueue<T>::pop(uint32_t active_mask)
 {
     optional<T> res;
-    while (!(res = try_pop()))
+    while (!(res = try_pop(active_mask)))
         ;
 
     return res.value();
@@ -279,11 +290,16 @@ uint64_t MPMCQueue<T>::size_approx() const
 }
 
 template<typename T>
-__host__ __device__ bool MPMCQueue<T>::try_sync()
+__host__ __device__ bool MPMCQueue<T>::try_sync(uint32_t active_mask)
 {
-    bool head = try_clear_head();
-    bool tail = try_clear_tail();
+    bool head = try_clear_head(active_mask);
+    bool tail = try_clear_tail(active_mask);
     return head || tail;
+}
+
+template<typename T>
+__device__ uint32_t MPMCQueue<T>::register_warp() const {
+    return get_active_mask(0);
 }
 
 template<typename T>
@@ -328,13 +344,13 @@ uint64_t MPMCQueue<T>::div_capacity(uint64_t val) const {
 }
 
 template<typename T>
-__host__ __device__ bool MPMCQueue<T>::try_push_internal(T val)
+__host__ __device__ bool MPMCQueue<T>::try_push_internal(T val, uint32_t active_mask)
 {
     uint64_t free_slots = _free.atomic_sub(1ul); // Consume one free slot
     if (free_slots == 0 || free_slots > INT64_MAX) // If free slots are 0 or 'negative'
     {
         _free.atomic_add(1ul); // Release free slot
-        if (try_clear_tail()) // See if we can advance tail
+        if (try_clear_tail(active_mask)) // See if we can advance tail
             return try_push(val); // Re attempt push if we made space
         return false;
     }
@@ -343,19 +359,19 @@ __host__ __device__ bool MPMCQueue<T>::try_push_internal(T val)
     uint64_t idx = mod_capacity(_head_unsafe.atomic_add(1ul));
     _data[idx] = val; // Write data
     _write_bitmap.setBit(idx); // Set bit
-    try_clear_head(); // Try to advance head pointer
+    try_clear_head(active_mask); // Try to advance head pointer
     return true;
 }
 
 template<typename T>
 __host__ __device__
-optional<T> MPMCQueue<T>::try_pop_internal()
+optional<T> MPMCQueue<T>::try_pop_internal(uint32_t active_mask)
 {
     uint64_t size = _size.atomic_sub(1ul); // Try consume an element
     if (size == 0 || size > INT64_MAX) // If size is 0 or 'negative'
     {
         _size.atomic_add(1ul); // Release spot
-        if (try_clear_head()) // Try advance head
+        if (try_clear_head(active_mask)) // Try advance head
             return try_pop(); // Reattempt if we made space
         return {};
     }
@@ -364,7 +380,7 @@ optional<T> MPMCQueue<T>::try_pop_internal()
     uint64_t idx = mod_capacity(_tail_unsafe.atomic_add(1ul));
     T out = _data[idx]; // Read data
     _write_bitmap.clearBit(idx); // Unset bit
-    try_clear_tail(); // Try to advance tail pointer
+    try_clear_tail(active_mask); // Try to advance tail pointer
     return {out};
 }
 
@@ -434,7 +450,7 @@ optional<uint64_t> MPMCQueue<T>::try_clear_range(const uint64_t start, const uin
 
 template<typename T>
 __host__ __device__
-bool MPMCQueue<T>::try_clear_head()
+bool MPMCQueue<T>::try_clear_head(uint32_t active_mask)
 {
     // Early exit if no pending requests
     if(_head_safe == _head_unsafe.value())
@@ -442,7 +458,7 @@ bool MPMCQueue<T>::try_clear_head()
 
 #ifdef __CUDA_ARCH__
     if(!_is_local) {
-        return try_clear_head_warp();
+        return try_clear_head_warp(active_mask);
     }
 #endif
 
@@ -471,7 +487,7 @@ bool MPMCQueue<T>::try_clear_head()
 
 template<typename T>
 __host__ __device__
-bool MPMCQueue<T>::try_clear_tail()
+bool MPMCQueue<T>::try_clear_tail(uint32_t active_mask)
 {
     // Early exit if no pending requests
     if(_tail_safe == _tail_unsafe.value())
@@ -479,7 +495,7 @@ bool MPMCQueue<T>::try_clear_tail()
 
 #ifdef __CUDA_ARCH__
     if(!_is_local) {
-        return try_clear_tail_warp();
+        return try_clear_tail_warp(active_mask);
     }
 #endif
 
@@ -510,44 +526,49 @@ __device__ uint32_t match_any_sync(uint32_t mask, uint64_t val) {
 #if __CUDA_ARCH__ >= 700
     return __match_any_sync(mask, val);
 #else
-    __shared__ uint64_t store[32];
-    store[threadIdx.x & 31] = val;
-
+#ifdef NO_SHARED_MEM_MATCH_ANY
     uint32_t out_mask = 0x0;
-
-    // Unroll adds ~6% performance for optimal use case (full warp cooperation).
-    // So we use fixed size loop rather than early termination (e.g. 32 - __clz(mask))
-#pragma unroll
-    for(uint32_t i = 0; i < 32; i++) {
-        if(mask & (1 << i)) {
-            // Vectorised loads caused performance decrease
-            out_mask |= (store[i] == val) << i;
-        }
-    }
-    return out_mask;
-
     // Using shared memory ~2x faster than __shfl_sync
-    /*
-    uint32_t out_mask = 0x0;
-    for(uint32_t i = 0; i < 32 - __clz(mask); i++) { // TODO 32 - __clz(mask)?
+    // 8k memory might be too much for some applications in which casse this can be a fallback
+    for(uint32_t i = 0; i < 32; i++) {
         if(mask & (1 << i)) {
             out_mask |= (__shfl_sync(mask, val, i) == val) << i;
         }
     }
     return out_mask;
-    */
+#else
+    assert(blockDim.x < 1024);
+    assert(blockDim.y == 1 && blockDim.z == 1);
+
+    __shared__ uint64_t source[1024];
+    uint32_t tid = threadIdx.x;
+    source[tid] = val;
+    uint32_t warp = tid >> 5;
+
+    uint32_t out_mask = 0x0;
+    for(uint32_t i = 0; i < 32; i++) {
+        if(mask & (1 << i)) {
+            out_mask |= (source[warp * 32 + i] == val) << i;
+        }
+    }
+    return out_mask;
+#endif
 #endif
 }
 
 template<typename T>
 __device__
-uint32_t MPMCQueue<T>::get_active_mask() const {
+uint32_t MPMCQueue<T>::get_active_mask(uint32_t active_mask) const {
     if(_is_local) {
         return 1 << (threadIdx.x & 31);
     }
 
-    uint32_t active_mask = __activemask();
-    return match_any_sync(active_mask, (uint64_t)this);
+    uint32_t full_active_mask = __activemask();
+    if(active_mask == 0) {
+        return match_any_sync(full_active_mask, (uint64_t)this); // Compare this ptr to find matching objects
+    } else {
+        return active_mask & full_active_mask; // Return set of actually active threads
+    }
 }
 
 template<typename T>
@@ -578,7 +599,7 @@ bool MPMCQueue<T>::try_push_internal_warp(T val, uint32_t active_mask)
             _free.atomic_add(active_threads); // Release slots
         }
         __syncwarp(active_mask); // Sync to ensure cooperation in clear_tail
-        if (try_clear_tail()) // Try to advance tail pointer
+        if (try_clear_tail(active_mask)) // Try to advance tail pointer
         {
             // Re attempt push if we made space
             return try_push(val);
@@ -645,7 +666,7 @@ bool MPMCQueue<T>::try_push_internal_warp(T val, uint32_t active_mask)
         entry += active_threads; // Loops for < 3 threads
     }
     __syncwarp(active_mask); // Sync to ensure cooperation in clear_head
-    try_clear_head();
+    try_clear_head(active_mask);
     return tid < successful;
 }
 
@@ -677,7 +698,7 @@ optional<T> MPMCQueue<T>::try_pop_internal_warp(uint32_t active_mask)
             _size.atomic_add(active_threads); // Release slots
         }
         __syncwarp(active_mask); // Sync to ensure cooperation in clear_head
-        if (try_clear_head()) // Try to advance head
+        if (try_clear_head(active_mask)) // Try to advance head
         {
             // Re attempt pop if we made space
             return try_pop();
@@ -746,7 +767,7 @@ optional<T> MPMCQueue<T>::try_pop_internal_warp(uint32_t active_mask)
         entry += active_threads; // Loops for < 3 threads
     }
     __syncwarp(active_mask); // Sync to ensure cooperation in clear_tail
-    try_clear_tail();
+    try_clear_tail(active_mask);
     return tid < successful ? optional<T>{out} : optional<T>{};
 }
 
@@ -834,7 +855,7 @@ __device__ optional<uint64_t> MPMCQueue<T>::try_clear_range_warp(const uint64_t 
     if (ffs(ballot) - 1 != lane)
         return {};
 
-    assert(__popc(get_active_mask()) == 1);
+    assert(__popc(get_active_mask(active_mask)) == 1);
 
     if(overshoot)
         return {end};
@@ -859,11 +880,11 @@ __device__ optional<uint64_t> MPMCQueue<T>::try_clear_range_warp(const uint64_t 
 
 template<typename T>
 __device__
-bool MPMCQueue<T>::try_clear_head_warp()
+bool MPMCQueue<T>::try_clear_head_warp(uint32_t active_mask)
 {
     assert(!_is_local);
 
-    uint32_t active_mask = get_active_mask();
+    active_mask = get_active_mask(active_mask);
 
     uint32_t tid0 = ffs(active_mask) - 1;
     bool is_tid0 = tid0 == (threadIdx.x & 31);
@@ -900,11 +921,11 @@ bool MPMCQueue<T>::try_clear_head_warp()
 
 template<typename T>
 __device__
-bool MPMCQueue<T>::try_clear_tail_warp()
+bool MPMCQueue<T>::try_clear_tail_warp(uint32_t active_mask)
 {
     assert(!_is_local);
 
-    uint32_t active_mask = get_active_mask();
+    active_mask = get_active_mask(active_mask);
 
     uint32_t tid0 = ffs(active_mask) - 1;
     bool is_tid0 = tid0 == (threadIdx.x & 31);

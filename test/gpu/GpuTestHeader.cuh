@@ -33,7 +33,7 @@ __managed__ cuAtomic<uint64_t>* GPU_GTEST_FAILURE = nullptr;
     cudaMallocManaged(&GPU_GTEST_FAILURE, sizeof(cuAtomic<uint64_t>)); \
     new(GPU_GTEST_FAILURE) cuAtomic<uint64_t>(0); \
     if (sync) { \
-        void* args[] = {(void*)&queue, (void*)&capacity, (void*)&num_threads }; \
+        void* args[] = {(void*)&queue, (void*)&capacity, (void*)&num_threads, (void*)&use_warp }; \
         int occupancy; cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occupancy, kernel, threads, 0); \
         int dev; cudaGetDevice(&dev); \
         cudaDeviceProp deviceProp; cudaGetDeviceProperties(&deviceProp, dev); \
@@ -41,7 +41,7 @@ __managed__ cuAtomic<uint64_t>* GPU_GTEST_FAILURE = nullptr;
         ASSERT_LE(ceil_div<uint64_t>(blocks, occupancy), deviceProp.multiProcessorCount) << "Too many threads: " << blocks << "/" << occupancy; \
         ASSERT_EQ(cudaLaunchCooperativeKernel((void*)kernel, blocks, threads, args), cudaSuccess) << "Launch failed"; \
     } else { \
-        kernel<<<blocks, threads>>>(queue, capacity, num_threads); \
+        kernel<<<blocks, threads>>>(queue, capacity, num_threads, use_warp); \
     } \
     auto err = cudaDeviceSynchronize(); /* Check error after checking ASSERT flag */ \
     ASSERT_EQ(GPU_GTEST_FAILURE->value(), 0) << GPU_GTEST_FAILURE->value() << " threads failed"; \
@@ -49,9 +49,9 @@ __managed__ cuAtomic<uint64_t>* GPU_GTEST_FAILURE = nullptr;
 
 // Declare test running as a device function
 #define GPU_TEST_P(cls, test) \
-__device__ void device_##test(MPMCQueue<uint64_t>*, uint64_t, uint32_t, grid_group, uint32_t);\
+__device__ void device_##test(MPMCQueue<uint64_t>*, uint64_t, uint32_t, grid_group, uint32_t, uint32_t);\
 __device__ MPMCQueue<uint64_t>* q_##test; \
-__global__ void kernel_##test(MPMCQueue<uint64_t>* q, uint64_t c, uint32_t n){ \
+__global__ void kernel_##test(MPMCQueue<uint64_t>* q, uint64_t c, uint32_t n, bool w){ \
     grid_group g = this_grid(); \
     uint32_t t = g.thread_rank(); \
 	if(t >= n) {return;} \
@@ -64,7 +64,9 @@ __global__ void kernel_##test(MPMCQueue<uint64_t>* q, uint64_t c, uint32_t n){ \
 		q = q_##test; \
 		alloc = true; \
 	} \
-    device_##test(q, c, n, g, t); \
+	uint32_t m = 0; \
+    if(w) { m = q->register_warp(); } \
+    device_##test(q, c, n, g, t, m); \
     g.sync(); \
     if(alloc && t == 0) { MPMCQueue<uint64_t>::freeHeterogeneousMPMCQueue(q); } \
 } \
@@ -72,25 +74,27 @@ TEST_P(cls, test) { \
     init(); \
     RUN_KERNEL(kernel_##test, true) \
 } \
-__device__ void device_##test(MPMCQueue<uint64_t>* queue, uint64_t capacity, uint32_t num_threads, grid_group grid, uint32_t tid)
+__device__ void device_##test(MPMCQueue<uint64_t>* queue, uint64_t capacity, uint32_t num_threads, grid_group grid, uint32_t tid, uint32_t active_mask)
 
 #define GPU_TEST_P_NO_SYNC(cls, test) \
-__device__ void device_##test(MPMCQueue<uint64_t>*, uint64_t, uint32_t, uint32_t);\
-__global__ void kernel_##test(MPMCQueue<uint64_t>* q, uint64_t c, uint32_t n){ \
+__device__ void device_##test(MPMCQueue<uint64_t>*, uint64_t, uint32_t, uint32_t, uint32_t);\
+__global__ void kernel_##test(MPMCQueue<uint64_t>* q, uint64_t c, uint32_t n, bool w){ \
     uint32_t t = threadIdx.x + blockDim.x * blockIdx.x; \
     if(t >= n) {return;} \
     bool alloc = false; \
     if(q == nullptr) { q = MPMCQueue<uint64_t>::allocHeterogeneousMPMCQueue(c); alloc = true; } \
-    device_##test(q, c, n, t); \
+    uint32_t m = 0; \
+    if(w) { m = q->register_warp(); } \
+    device_##test(q, c, n, t, m); \
     if(alloc) { MPMCQueue<uint64_t>::freeHeterogeneousMPMCQueue(q); } \
 }\
 TEST_P(cls, test) { \
     init(); \
     RUN_KERNEL(kernel_##test, false) \
 } \
-__device__ void device_##test(MPMCQueue<uint64_t>* queue, uint64_t capacity, uint32_t num_threads, uint32_t tid)
+__device__ void device_##test(MPMCQueue<uint64_t>* queue, uint64_t capacity, uint32_t num_threads, uint32_t tid, uint32_t active_mask)
 
-class MPMCGpuTests : public ::testing::TestWithParam<std::tuple<uint64_t, uint32_t, bool>> {
+class MPMCGpuTests : public ::testing::TestWithParam<std::tuple<uint64_t, uint32_t, bool, bool>> {
 protected:
     void init() {
         capacity = std::get<0>(GetParam());
@@ -98,6 +102,8 @@ protected:
         blocks = ceil_div(num_threads, threads);
 
         host_alloc = std::get<2>(GetParam());
+
+        use_warp = std::get<3>(GetParam());
 
         if(host_alloc)
             queue = MPMCQueue<uint64_t>::allocHeterogeneousMPMCQueue(capacity);
@@ -118,4 +124,6 @@ protected:
 
     // queue param will be nullptr on test start
     bool host_alloc;
+
+    bool use_warp;
 };

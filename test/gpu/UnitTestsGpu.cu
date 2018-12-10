@@ -136,7 +136,7 @@ GPU_TEST_P_NO_SYNC(MPMCGpuTests, PushPopDecreasingNum) {
 
 INSTANTIATE_TEST_CASE_P(MPMCGpuTests,
                         MPMCGpuTests,
-                        ::testing::Combine(::testing::Values(1, 10, 1024, 65536, 65537, 128*1024), ::testing::Values(1u), ::testing::Bool()));
+                        ::testing::Combine(::testing::Values(1, 10, 1024, 65536, 65537, 128*1024), ::testing::Values(1u), ::testing::Bool(), ::testing::Values(false)));
 
 int main(int argc, char **argv) {
   ::testing::InitGoogleTest(&argc, argv);

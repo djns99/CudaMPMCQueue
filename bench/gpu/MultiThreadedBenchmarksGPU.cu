@@ -1,45 +1,51 @@
 #include "GpuBenchmarkHeader.cuh"
 
 __global__ void PushPartEach(CudaMPMCQueue::MPMCQueue<uint8_t>* queue, size_t num_ops) {
+    uint32_t active_mask = queue->register_warp();
     for(size_t i = 0; i < num_ops; i++) {
-        queue->push(0);
+        queue->push(0, active_mask);
     }
 }
 
 __global__ void PopPartEach(CudaMPMCQueue::MPMCQueue<uint8_t>* queue, size_t num_ops) {
+    uint32_t active_mask = queue->register_warp();
     for(size_t i = 0; i < num_ops; i++) {
-        queue->pop();
+        queue->pop(active_mask);
     }
 }
 
 __global__ void PushPopPartEach(CudaMPMCQueue::MPMCQueue<uint8_t>* queue, size_t num_ops) {
+    uint32_t active_mask = queue->register_warp();
     for(size_t i = 0; i < num_ops; i++) {
-        queue->push(0);
+        queue->push(0, active_mask);
     }
 
     for(size_t i = 0; i < num_ops; i++) {
-        queue->pop();
+        queue->pop(active_mask);
     }
 }
 
 __global__ void InterleavedPushPopPartEach(CudaMPMCQueue::MPMCQueue<uint8_t>* queue, size_t num_ops) {
+    uint32_t active_mask = queue->register_warp();
+
     for(size_t i = 0; i < num_ops; i++) {
-        queue->push(0);
-        queue->pop();
+        queue->push(0, active_mask);
+        queue->pop(active_mask);
     }
 }
 
 __global__ void PushPopFullContention(CudaMPMCQueue::MPMCQueue<uint8_t>* queue) {
     const size_t capacity = queue->capacity();
+    uint32_t active_mask = queue->register_warp();
 
     bool pushing = true;
     for(uint64_t i = 0; i < capacity; ) {
         // Use try_* methods to allow threads to avoid deadlocks
-        if(pushing && queue->try_push( 0 )) {
+        if(pushing && queue->try_push( 0, active_mask )) {
             pushing = false;
         }
 
-        if(!pushing && queue->try_pop()) {
+        if(!pushing && queue->try_pop(active_mask)) {
             pushing = true;
             i++;
         }
@@ -128,7 +134,7 @@ void PushPopFullContention(benchmark::State& state) {
 
     SETUP_BENCHMARK_THREADED
 
-    if(use_warps || num_threads * capacity <= (1u<<26)) {
+    if((use_warps && (num_threads * capacity <= (1ul<<31))) || (!use_warps && (num_threads * capacity <= (1u<<26)))){
         for(auto _ : state) {
             START_TIMING
             PushPopFullContention<<<num_blocks, threads_per_block>>>(queue);
