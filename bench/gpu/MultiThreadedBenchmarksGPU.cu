@@ -1,51 +1,45 @@
 #include "GpuBenchmarkHeader.cuh"
 
 __global__ void PushPartEach(CudaMPMCQueue::MPMCQueue<uint8_t>* queue, size_t num_ops) {
-    uint32_t active_mask = queue->register_warp();
     for(size_t i = 0; i < num_ops; i++) {
-        queue->push(0, active_mask);
+        queue->push(0, 0xffffffff);
     }
 }
 
 __global__ void PopPartEach(CudaMPMCQueue::MPMCQueue<uint8_t>* queue, size_t num_ops) {
-    uint32_t active_mask = queue->register_warp();
     for(size_t i = 0; i < num_ops; i++) {
-        queue->pop(active_mask);
+        queue->pop(0xffffffff);
     }
 }
 
 __global__ void PushPopPartEach(CudaMPMCQueue::MPMCQueue<uint8_t>* queue, size_t num_ops) {
-    uint32_t active_mask = queue->register_warp();
     for(size_t i = 0; i < num_ops; i++) {
-        queue->push(0, active_mask);
+        queue->push(0, 0xffffffff);
     }
 
     for(size_t i = 0; i < num_ops; i++) {
-        queue->pop(active_mask);
+        queue->pop(0xffffffff);
     }
 }
 
 __global__ void InterleavedPushPopPartEach(CudaMPMCQueue::MPMCQueue<uint8_t>* queue, size_t num_ops) {
-    uint32_t active_mask = queue->register_warp();
-
     for(size_t i = 0; i < num_ops; i++) {
-        queue->push(0, active_mask);
-        queue->pop(active_mask);
+        queue->push(0, 0xffffffff);
+        queue->pop(0xffffffff);
     }
 }
 
 __global__ void PushPopFullContention(CudaMPMCQueue::MPMCQueue<uint8_t>* queue) {
     const size_t capacity = queue->capacity();
-    uint32_t active_mask = queue->register_warp();
 
     bool pushing = true;
     for(uint64_t i = 0; i < capacity; ) {
         // Use try_* methods to allow threads to avoid deadlocks
-        if(pushing && queue->try_push( 0, active_mask )) {
+        if(pushing && queue->try_push( 0, 0xffffffff )) {
             pushing = false;
         }
 
-        if(!pushing && queue->try_pop(active_mask)) {
+        if(!pushing && queue->try_pop( 0xffffffff )) {
             pushing = true;
             i++;
         }
@@ -59,8 +53,8 @@ void PushPartEach(benchmark::State& state) {
 
     SETUP_BENCHMARK_THREADED
 
+    const size_t num_ops = capacity / num_threads;
     for(auto _ : state) {
-        const size_t num_ops = capacity / num_threads;
         START_TIMING
         PushPartEach<<<num_blocks, threads_per_block>>>(queue, num_ops);
         STOP_TIMING
@@ -78,8 +72,8 @@ void PopPartEach(benchmark::State& state) {
 
     SETUP_BENCHMARK_THREADED
 
+    const size_t num_ops = capacity / num_threads;
     for(auto _ : state) {
-        const size_t num_ops = capacity / num_threads;
 
         FILL_QUEUE
 
@@ -98,8 +92,8 @@ void PushPopPartEach(benchmark::State& state) {
 
     SETUP_BENCHMARK_THREADED
 
+    const size_t num_ops = capacity / num_threads;
     for(auto _ : state) {
-        const size_t num_ops = capacity / num_threads;
 
         START_TIMING
         PushPopPartEach<<<num_blocks, threads_per_block>>>(queue, num_ops);
@@ -116,8 +110,8 @@ void InterleavedPushPopPartEach(benchmark::State& state) {
 
     SETUP_BENCHMARK_THREADED
 
+    const size_t num_ops = capacity / num_threads;
     for(auto _ : state) {
-        const size_t num_ops = capacity / num_threads;
 
         START_TIMING
         InterleavedPushPopPartEach<<<num_blocks, threads_per_block>>>(queue, num_ops);

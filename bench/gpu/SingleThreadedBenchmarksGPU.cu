@@ -4,7 +4,7 @@ __global__ void FillQueue(CudaMPMCQueue::MPMCQueue<uint8_t>* queue) {
     assert(queue->size_approx() == 0);
     const size_t capacity = queue->capacity();
     for( size_t i = 0; i < capacity; i++) {
-        queue->push(0);
+        queue->push(0, 0x1);
     }
 }
 
@@ -12,7 +12,7 @@ __global__ void EmptyQueue(CudaMPMCQueue::MPMCQueue<uint8_t>* queue) {
     assert(queue->size_approx() == queue->capacity());
     const size_t capacity = queue->capacity();
     for( size_t i = 0; i < capacity; i++) {
-        queue->pop();
+        queue->pop(0x1);
     }
 }
 
@@ -20,19 +20,19 @@ __global__ void FillEmptyQueue(CudaMPMCQueue::MPMCQueue<uint8_t>* queue) {
     assert(queue->size_approx() == 0);
     const size_t capacity = queue->capacity();
     for( size_t i = 0; i < capacity; i++) {
-        queue->push(0);
+        queue->push(0, 0x1);
     }
 
     for( size_t i = 0; i < capacity; i++) {
-        queue->pop();
+        queue->pop(0x1);
     }
 }
 
 __global__ void InterleavedFillEmptyQueue(CudaMPMCQueue::MPMCQueue<uint8_t>* queue) {
     const size_t capacity = queue->capacity();
     for( size_t i = 0; i < capacity; i++) {
-        queue->push(0);
-        queue->pop();
+        queue->push(0, 0x1);
+        queue->pop(0x1);
     }
 }
 
